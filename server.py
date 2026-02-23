@@ -20,7 +20,7 @@ app = Flask(__name__)
 
 # ── Configuración desde variables de entorno ──────────────────────────────────
 ADMIN_TOKEN    = os.environ.get("ADMIN_TOKEN", "")
-LICENSE_SECRET = os.environ.get("LICENSE_SECRET", "").encode()
+LICENSE_SECRET = os.environ.get("LICENSE_SECRET", "SoremMacro_LicenseSystem_v1_2026").encode()
 
 # ── Base de datos en memoria (persistida en archivo) ──────────────────────────
 # En Render el filesystem es efímero, pero para uso básico funciona.
