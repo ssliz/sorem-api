@@ -1,54 +1,78 @@
 """
-SoremMacro License API Server
-Despliega esto en Render.com como un Web Service Python.
-Variables de entorno requeridas (las configuras en Render, NUNCA en el código):
-  ADMIN_TOKEN   → contraseña secreta para el KeyGen (invéntatela tú)
-  LICENSE_SECRET → secreto HMAC para verificar keys (igual que en el KeyGen)
+SoremMacro License API Server v2 — con PostgreSQL persistente
+Variables de entorno requeridas en Render:
+  ADMIN_TOKEN     → contraseña secreta para el KeyGen
+  LICENSE_SECRET  → secreto HMAC para verificar keys
+  DATABASE_URL    → se añade automáticamente al conectar la DB de Render
 """
 
 import os
-import json
 import hmac
 import hashlib
-import secrets
 import time
+import psycopg2
+import psycopg2.extras
 from datetime import datetime
 from functools import wraps
 from flask import Flask, request, jsonify
 
 app = Flask(__name__)
 
-# ── Configuración desde variables de entorno ──────────────────────────────────
+# ── Config desde variables de entorno ─────────────────────────────────────────
 ADMIN_TOKEN    = os.environ.get("ADMIN_TOKEN", "")
-LICENSE_SECRET = os.environ.get("LICENSE_SECRET", "SoremMacro_LicenseSystem_v1_2026").encode()
+LICENSE_SECRET = os.environ.get("LICENSE_SECRET", "").encode()
+DATABASE_URL   = os.environ.get("DATABASE_URL", "")
 
-# ── Base de datos en memoria (persistida en archivo) ──────────────────────────
-# En Render el filesystem es efímero, pero para uso básico funciona.
-# Para persistencia real usarías una DB como PostgreSQL (Render la ofrece gratis).
-DATA_FILE = "/tmp/keys_data.json"
+# ── Conexión a PostgreSQL ─────────────────────────────────────────────────────
+def get_db():
+    conn = psycopg2.connect(DATABASE_URL, sslmode="require")
+    conn.autocommit = True
+    return conn
 
-def load_data():
-    if os.path.exists(DATA_FILE):
-        try:
-            with open(DATA_FILE, "r") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {"keys": [], "banned": [], "deactivated": []}
+def init_db():
+    """Crea las tablas si no existen."""
+    conn = get_db()
+    cur  = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS keys (
+            key        TEXT PRIMARY KEY,
+            hwid       TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            last_seen  TEXT
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS banned (
+            key       TEXT PRIMARY KEY,
+            hwid      TEXT,
+            reason    TEXT,
+            banned_at TEXT NOT NULL
+        );
+    """)
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS deactivated (
+            key            TEXT PRIMARY KEY,
+            reason         TEXT,
+            deactivated_at TEXT NOT NULL
+        );
+    """)
+    cur.close()
+    conn.close()
 
-def save_data(data):
-    with open(DATA_FILE, "w") as f:
-        json.dump(data, f, indent=2)
+# Inicializar tablas al arrancar
+try:
+    init_db()
+except Exception as e:
+    print(f"[WARN] No se pudo inicializar la DB: {e}")
 
-# ── Rate limiting simple en memoria ──────────────────────────────────────────
-_rate_limits = {}  # ip -> [timestamp, ...]
-RATE_WINDOW  = 60   # segundos
-RATE_MAX     = 15   # max requests por ventana por IP
+# ── Rate limiting en memoria ──────────────────────────────────────────────────
+_rate_limits = {}
+RATE_WINDOW  = 60
+RATE_MAX     = 15
 
 def is_rate_limited(ip):
-    now = time.time()
-    hits = _rate_limits.get(ip, [])
-    hits = [t for t in hits if now - t < RATE_WINDOW]
+    now  = time.time()
+    hits = [t for t in _rate_limits.get(ip, []) if now - t < RATE_WINDOW]
     _rate_limits[ip] = hits
     if len(hits) >= RATE_MAX:
         return True
@@ -76,15 +100,14 @@ def rate_limit(f):
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def verify_key_hmac(key, hwid):
-    """Verifica que la key sea matemáticamente válida para ese HWID."""
     try:
         parts = key.replace(" ", "").upper().split("-")
         if len(parts) != 5 or parts[0] != "SRM":
             return False
-        rand     = parts[1] + parts[2]
+        rand      = parts[1] + parts[2]
         sig_given = parts[3] + parts[4]
-        sig_expected = hmac.new(LICENSE_SECRET, (rand + hwid).encode(), hashlib.sha256).hexdigest()[:8].upper()
-        return hmac.compare_digest(sig_given, sig_expected)
+        sig_exp   = hmac.new(LICENSE_SECRET, (rand + hwid).encode(), hashlib.sha256).hexdigest()[:8].upper()
+        return hmac.compare_digest(sig_given, sig_exp)
     except Exception:
         return False
 
@@ -92,17 +115,12 @@ def now_str():
     return datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S UTC")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RUTAS PÚBLICAS (usadas por la macro)
+# RUTAS PÚBLICAS
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/verify", methods=["POST"])
 @rate_limit
 def verify():
-    """
-    La macro llama a esto al arrancar y cada 10 min.
-    Body JSON: { "key": "SRM-...", "hwid": "XXXX" }
-    Respuesta: { "valid": true/false, "reason": "..." }
-    """
     body = request.get_json(silent=True)
     if not body:
         return jsonify({"valid": False, "reason": "Bad request"}), 400
@@ -117,38 +135,44 @@ def verify():
     if not verify_key_hmac(key, hwid):
         return jsonify({"valid": False, "reason": "Key inválida para este HWID."})
 
-    data = load_data()
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
 
-    # 2. ¿Key existe en el sistema?
-    all_keys = [k["key"] for k in data.get("keys", [])]
-    if key not in all_keys:
-        return jsonify({"valid": False, "reason": "Key no registrada en el sistema."})
+        # 2. ¿Key existe?
+        cur.execute("SELECT * FROM keys WHERE key = %s", (key,))
+        key_row = cur.fetchone()
+        if not key_row:
+            cur.close(); conn.close()
+            return jsonify({"valid": False, "reason": "Key no registrada en el sistema."})
 
-    # 3. ¿Key baneada?
-    for b in data.get("banned", []):
-        if b.get("key") == key:
-            return jsonify({"valid": False, "reason": f"Tu licencia ha sido BANEADA. Motivo: {b.get('reason', 'Sin motivo')}"})
-        if b.get("hwid") == hwid:
-            return jsonify({"valid": False, "reason": "Tu HWID ha sido BANEADO por el administrador."})
+        # 3. ¿Key baneada?
+        cur.execute("SELECT * FROM banned WHERE key = %s OR hwid = %s", (key, hwid))
+        ban_row = cur.fetchone()
+        if ban_row:
+            reason = ban_row["reason"] or "Sin motivo"
+            if ban_row["key"] == key:
+                msg = f"Tu licencia ha sido BANEADA. Motivo: {reason}"
+            else:
+                msg = "Tu HWID ha sido BANEADO por el administrador."
+            cur.close(); conn.close()
+            return jsonify({"valid": False, "reason": msg})
 
-    # 4. ¿Key desactivada?
-    for d in data.get("deactivated", []):
-        if d.get("key") == key:
-            return jsonify({"valid": False, "reason": f"Tu licencia ha sido DESACTIVADA. Motivo: {d.get('reason', 'Sin motivo')}"})
+        # 4. ¿Key desactivada?
+        cur.execute("SELECT * FROM deactivated WHERE key = %s", (key,))
+        deact_row = cur.fetchone()
+        if deact_row:
+            reason = deact_row["reason"] or "Sin motivo"
+            cur.close(); conn.close()
+            return jsonify({"valid": False, "reason": f"Tu licencia ha sido DESACTIVADA. Motivo: {reason}"})
 
-    # 5. Todo OK — registrar activación
-    found = False
-    for k in data["keys"]:
-        if k["key"] == key:
-            k["last_seen"] = now_str()
-            k["hwid"] = hwid
-            found = True
-            break
-    if not found:
-        data["keys"].append({"key": key, "hwid": hwid, "last_seen": now_str()})
-    save_data(data)
+        # 5. Todo OK — actualizar last_seen
+        cur.execute("UPDATE keys SET last_seen = %s, hwid = %s WHERE key = %s", (now_str(), hwid, key))
+        cur.close(); conn.close()
+        return jsonify({"valid": True, "reason": ""})
 
-    return jsonify({"valid": True, "reason": ""})
+    except Exception as e:
+        return jsonify({"valid": False, "reason": f"Error del servidor. Inténtalo de nuevo."}), 500
 
 
 @app.route("/health", methods=["GET"])
@@ -157,128 +181,153 @@ def health():
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# RUTAS DE ADMIN (solo KeyGen — requieren X-Admin-Token)
+# RUTAS DE ADMIN
 # ─────────────────────────────────────────────────────────────────────────────
 
 @app.route("/admin/keys", methods=["GET"])
 @require_admin
 def admin_get_keys():
-    """Devuelve todos los datos: keys, banned, deactivated."""
-    return jsonify(load_data())
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("SELECT * FROM keys ORDER BY created_at DESC")
+        keys = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT * FROM banned ORDER BY banned_at DESC")
+        banned = [dict(r) for r in cur.fetchall()]
+        cur.execute("SELECT * FROM deactivated ORDER BY deactivated_at DESC")
+        deactivated = [dict(r) for r in cur.fetchall()]
+        cur.close(); conn.close()
+        return jsonify({"keys": keys, "banned": banned, "deactivated": deactivated})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/admin/keys/create", methods=["POST"])
 @require_admin
 def admin_create_key():
-    """
-    Registra una key nueva en el servidor.
-    Body: { "key": "SRM-...", "hwid": "XXXX" }
-    """
     body = request.get_json(silent=True) or {}
     key  = str(body.get("key",  "")).strip().upper()
     hwid = str(body.get("hwid", "")).strip().upper()
     if not key or not hwid:
         return jsonify({"error": "Missing key or hwid"}), 400
-
-    data = load_data()
-    if any(k["key"] == key for k in data["keys"]):
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute(
+            "INSERT INTO keys (key, hwid, created_at, last_seen) VALUES (%s, %s, %s, NULL)",
+            (key, hwid, now_str())
+        )
+        cur.close(); conn.close()
+        return jsonify({"ok": True, "key": key})
+    except psycopg2.errors.UniqueViolation:
         return jsonify({"error": "Key ya existe"}), 409
-
-    data["keys"].append({
-        "key":     key,
-        "hwid":    hwid,
-        "created": now_str(),
-        "last_seen": None,
-    })
-    save_data(data)
-    return jsonify({"ok": True, "key": key})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/admin/ban", methods=["POST"])
 @require_admin
 def admin_ban():
-    """Banea una key. Body: { "key": "SRM-...", "reason": "..." }"""
-    body = request.get_json(silent=True) or {}
+    body   = request.get_json(silent=True) or {}
     key    = str(body.get("key",    "")).strip().upper()
     reason = str(body.get("reason", "Sin motivo")).strip()
     if not key:
         return jsonify({"error": "Missing key"}), 400
-
-    data = load_data()
-    # Quitar de deactivated si estaba
-    data["deactivated"] = [d for d in data["deactivated"] if d.get("key") != key]
-    # Añadir a banned si no está
-    if not any(b.get("key") == key for b in data["banned"]):
+    try:
+        conn = get_db()
+        cur  = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         # Buscar hwid
-        hwid = next((k["hwid"] for k in data["keys"] if k["key"] == key), "")
-        data["banned"].append({"key": key, "hwid": hwid, "reason": reason, "banned_at": now_str()})
-    save_data(data)
-    return jsonify({"ok": True})
+        cur.execute("SELECT hwid FROM keys WHERE key = %s", (key,))
+        row  = cur.fetchone()
+        hwid = row["hwid"] if row else ""
+        # Quitar de deactivated
+        cur.execute("DELETE FROM deactivated WHERE key = %s", (key,))
+        # Insertar en banned
+        cur.execute("""
+            INSERT INTO banned (key, hwid, reason, banned_at)
+            VALUES (%s, %s, %s, %s)
+            ON CONFLICT (key) DO UPDATE SET reason = EXCLUDED.reason, banned_at = EXCLUDED.banned_at
+        """, (key, hwid, reason, now_str()))
+        cur.close(); conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/admin/unban", methods=["POST"])
 @require_admin
 def admin_unban():
-    """Quita el ban de una key. Body: { "key": "SRM-..." }"""
     body = request.get_json(silent=True) or {}
     key  = str(body.get("key", "")).strip().upper()
     if not key:
         return jsonify({"error": "Missing key"}), 400
-
-    data = load_data()
-    data["banned"] = [b for b in data["banned"] if b.get("key") != key]
-    save_data(data)
-    return jsonify({"ok": True})
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM banned WHERE key = %s", (key,))
+        cur.close(); conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/admin/deactivate", methods=["POST"])
 @require_admin
 def admin_deactivate():
-    """Desactiva una key. Body: { "key": "SRM-...", "reason": "..." }"""
-    body = request.get_json(silent=True) or {}
+    body   = request.get_json(silent=True) or {}
     key    = str(body.get("key",    "")).strip().upper()
     reason = str(body.get("reason", "Sin motivo")).strip()
     if not key:
         return jsonify({"error": "Missing key"}), 400
-
-    data = load_data()
-    if not any(d.get("key") == key for d in data["deactivated"]):
-        data["deactivated"].append({"key": key, "reason": reason, "deactivated_at": now_str()})
-    save_data(data)
-    return jsonify({"ok": True})
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("""
+            INSERT INTO deactivated (key, reason, deactivated_at)
+            VALUES (%s, %s, %s)
+            ON CONFLICT (key) DO UPDATE SET reason = EXCLUDED.reason, deactivated_at = EXCLUDED.deactivated_at
+        """, (key, reason, now_str()))
+        cur.close(); conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/admin/reactivate", methods=["POST"])
 @require_admin
 def admin_reactivate():
-    """Reactiva una key (quita de deactivated y banned). Body: { "key": "SRM-..." }"""
     body = request.get_json(silent=True) or {}
     key  = str(body.get("key", "")).strip().upper()
     if not key:
         return jsonify({"error": "Missing key"}), 400
-
-    data = load_data()
-    data["deactivated"] = [d for d in data["deactivated"] if d.get("key") != key]
-    data["banned"]      = [b for b in data["banned"]      if b.get("key") != key]
-    save_data(data)
-    return jsonify({"ok": True})
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM deactivated WHERE key = %s", (key,))
+        cur.execute("DELETE FROM banned      WHERE key = %s", (key,))
+        cur.close(); conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/admin/delete", methods=["POST"])
 @require_admin
 def admin_delete():
-    """Elimina una key de todo. Body: { "key": "SRM-..." }"""
     body = request.get_json(silent=True) or {}
     key  = str(body.get("key", "")).strip().upper()
     if not key:
         return jsonify({"error": "Missing key"}), 400
-
-    data = load_data()
-    data["keys"]        = [k for k in data["keys"]        if k.get("key") != key]
-    data["banned"]      = [b for b in data["banned"]      if b.get("key") != key]
-    data["deactivated"] = [d for d in data["deactivated"] if d.get("key") != key]
-    save_data(data)
-    return jsonify({"ok": True})
+    try:
+        conn = get_db()
+        cur  = conn.cursor()
+        cur.execute("DELETE FROM keys        WHERE key = %s", (key,))
+        cur.execute("DELETE FROM banned      WHERE key = %s", (key,))
+        cur.execute("DELETE FROM deactivated WHERE key = %s", (key,))
+        cur.close(); conn.close()
+        return jsonify({"ok": True})
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 if __name__ == "__main__":
